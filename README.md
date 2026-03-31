@@ -1,188 +1,330 @@
-# Claude-code
+# Claude Code — Architecture & Process Guide
 
-`Claude-code` is a large TypeScript/Bun source snapshot for an interactive coding assistant that combines a terminal UI, command-driven workflows, tool execution, Model Context Protocol (MCP) integration, remote bridge/session plumbing, and multi-agent orchestration.
-
-> This repository is useful as a recovery/reference codebase today, but it is not a complete, self-contained application checkout yet.
+> A deep-dive into how Claude Code works: the agent loop, tool layer, subagent spawning, memory system, and the harness that ties it all together.
 
 ---
 
-## Architecture
+## Table of Contents
 
-![Claude Code Architecture](./claude_code_architecture.svg)
-
-The codebase is organized into the following layers, from top to bottom:
-
-| Layer | Modules | Purpose |
-|---|---|---|
-| **Entry points** | `main.tsx`, `replLauncher.tsx`, `dialogLaunchers.tsx`, `setup.ts`, `bootstrap/` | CLI wiring, session initialization, startup profiling |
-| **Commands** | `commands.ts`, `commands/` | Feature-gated slash-command registry (100+ commands) |
-| **Query engine** | `QueryEngine.ts`, `query.ts` | Prompt/response cycle management |
-| **Tool execution** | `Tool.ts`, `tools.ts`, `tasks.ts` | Typed tool contracts, permissions, progress tracking |
-| **Built-in tools** | `tools/` | BashTool, FileRead/Edit/Write, GlobTool, GrepTool, WebFetch, WebSearch, AgentTool, SkillTool, Task\*, MCP tools, Plan/Worktree |
-| **Terminal UI** | `components/`, `screens/`, `ink/`, `outputStyles/` | React/Ink TUI components and interactive views |
-| **State & context** | `state/`, `context/`, `hooks/`, `history.ts` | App state, providers, runtime context |
-| **Services** | `services/`, `moreright/` | MCP, API clients, auth, telemetry, policy |
-| **Remote & server** | `bridge/`, `remote/`, `server/`, `upstreamproxy/` | Session bridge, transport, upstream proxy |
-| **Multi-agent** | `coordinator/`, `tasks/`, `buddy/`, `Task.ts` | Teammate workflows, swarm execution |
-| **Extensibility** | `plugins/`, `skills/`, `migrations/`, `native-ts/` | Plugin and skill loading, version migrations |
-| **Shared contracts** | `schemas/`, `types/`, `constants/`, `utils/`, `query/`, `memdir/` | Cross-cutting types and utilities |
-| **Gated UX surfaces** | `voice/`, `vim/`, `keybindings/`, `interactiveHelpers.tsx` | Feature-flagged interaction modes |
+1. [What is Claude Code?](#what-is-claude-code)
+2. [The Agent Loop — Core Pattern](#the-agent-loop)
+3. [Tool Layer](#tool-layer)
+4. [Subagent Spawning](#subagent-spawning)
+5. [Memory Architecture](#memory-architecture)
+6. [The Full End-to-End Flow](#full-flow)
+7. [Key Design Principles](#design-principles)
+8. [Quickstart](#quickstart)
+9. [Configuration](#configuration)
+10. [Contributing](#contributing)
 
 ---
 
-## Current Status
+## What is Claude Code? <a name="what-is-claude-code"></a>
 
-As currently imported, this repository contains the application source tree itself rather than the full original project scaffold.
+Claude Code is an **agentic coding harness** — not just a model, not just an IDE plugin, but a complete environment in which an AI agent can perceive, plan, act, and iterate until a coding task is done.
 
-**What is present:**
+Stripped to its essence:
 
-- Core entrypoints: `main.tsx`, `commands.ts`, `Tool.ts`, `tools.ts`, `QueryEngine.ts`, `Task.ts`
-- A large command surface under `commands/`
-- A large tool surface under `tools/`
-- UI, services, state, bridge, plugin, skill, and swarm-related modules
-- Roughly 4,100 tracked files in total
+```
+Claude Code = one agent loop
+            + tools (bash, read, write, edit, grep, browser…)
+            + on-demand skill loading
+            + context compression
+            + subagent spawning
+            + task system with dependency graph
+            + team coordination via async mailboxes
+            + worktree isolation for parallel execution
+            + permission governance
+```
 
-**What is not present at the repo root:**
-
-- `package.json`
-- Lockfiles (`pnpm-lock.yaml`, `yarn.lock`, or `package-lock.json`)
-- Top-level TypeScript/build config files
-- CI/release metadata
-- License metadata
-
-**Practical implication:** this repo is good for code reading, indexing, search, selective extraction, and reconstruction work. It is not guaranteed to build or run out of the box until the missing project scaffolding is restored.
+The model decides when to call tools and when to stop. The harness executes what the model asks for, manages context, and stays out of the way.
 
 ---
 
-## What This Codebase Does
+## The Agent Loop <a name="the-agent-loop"></a>
 
-Based on the included source, this project implements an agentic coding assistant with:
+Every turn follows the same minimal loop:
 
-- An interactive CLI/TUI application bootstrapped from `main.tsx`
-- A large slash-command style command system registered in `commands.ts`
-- A typed tool execution model centered around `Tool.ts` and `tools.ts`
-- Built-in tools for shell execution, file operations, search, web access, notebooks, tasks, planning, MCP resources, and agent workflows
-- Plugin and skill discovery/loading
-- Remote session and bridge infrastructure
-- Multi-agent and swarm/coordinator utilities
-- React/Ink-based terminal UI components and dialogs
-- Supporting systems for config, auth, telemetry, permissions, keybindings, onboarding, vim-like interaction, and voice-related features
+```
+User ──► messages[] ──► LLM ──► response
+                                    │
+                          stop_reason == "tool_use"?
+                                   / \
+                                 yes   no
+                                  │     │
+                           execute   return text
+                            tools
+                               │
+                        append results
+                               │
+                        ──► messages[]   (loop back)
+```
 
-Many capabilities are feature-gated. The source uses `bun:bundle` feature flags and environment checks, so the exact command and tool surface depends on the original build configuration.
+### Step by step
 
----
+**1. Build context** — At the start of each turn, the harness injects:
+- The contents of `CLAUDE.md` (project rules, coding standards)
+- Any loaded skill files
+- Compressed summaries of prior turns (if context was compacted)
+- The current task state from the dependency graph
 
-## Repository Layout
+**2. LLM inference** — The assembled `messages[]` array is sent to the Claude model. The model responds with either a final text answer or one or more `tool_use` blocks.
 
-One important detail: the imported code now lives at the repository root. In the original project, some imports were clearly relying on alias/path configuration such as `src/...`. That means the current layout is best understood as a recovered source root, not a finished standalone repo.
+**3. Tool dispatch** — If `stop_reason == "tool_use"`, the harness executes each requested tool, appends the results as `tool_result` blocks, and loops back to step 2.
 
-| Path | Purpose |
-|---|---|
-| `main.tsx` | Main startup path, bootstrap logic, CLI wiring, session initialization |
-| `commands.ts` | Central command registry and feature-gated command loading |
-| `Tool.ts` | Shared tool contracts, context, permissions, and tool-related types |
-| `tools.ts` | Source of truth for built-in tool registration |
-| `commands/` | 100+ command modules covering config, review, agents, MCP, skills, plugins, files, status, usage, export, and more |
-| `tools/` | Built-in tools: bash, file read/edit/write, grep/glob, web fetch/search, plan/worktree, MCP, tasks, and agent/team operations |
-| `components/` and `screens/` | React/Ink UI components and interactive views |
-| `state/` and `context/` | App state, providers, and cross-cutting runtime context |
-| `services/` | Higher-level service integrations including MCP, APIs, policy, tips, and background infrastructure |
-| `bridge/`, `remote/`, and `server/` | Remote control, session bridge, transport, and server-side plumbing |
-| `plugins/` and `skills/` | Extensibility systems for plugin and skill loading |
-| `coordinator/`, `tasks/`, and `utils/swarm/` | Multi-agent coordination, teammate workflows, and swarm execution helpers |
-| `migrations/` | Configuration and behavior migrations across versions |
-| `schemas/`, `types/`, and `constants/` | Shared contracts and configuration types |
-| `voice/`, `buddy/`, `vim/`, `keybindings/` | Optional UX surfaces and interaction modes |
+**4. Stop** — When the model responds without a `tool_use`, the loop exits and the response is returned to the user (or parent agent).
+
+This loop is intentionally minimal. There are no rigid decision trees, no hard-coded workflows. The model drives; the harness serves.
 
 ---
 
-## Notable Capabilities
+## Tool Layer <a name="tool-layer"></a>
 
-**Command surface:**
+Claude Code gives the agent a rich set of tools to operate on real systems:
 
-- `help`, `config`, `login`, `logout`, `status`, `usage`, `export`
-- `review`, `security-review`, `diff`, `files`, `branch`, `commit-push-pr`
-- `agents`, `tasks`, `plan`, `permissions`, `skills`, `plugin`, `reload-plugins`
-- `mcp`, `teleport`, `remote-env`, `desktop`, `mobile`, `ide`
-- `theme`, `vim`, `keybindings`, `voice`, `summary`, `release-notes`
+| Tool | What it does |
+|------|-------------|
+| `Bash` | Run shell commands, scripts, git operations, package managers |
+| `Read / Write / Edit` | Read file contents, write new files, apply targeted edits |
+| `Glob / Grep` | Find files by pattern, search content with ripgrep |
+| `Browser` | Fetch URLs, scrape pages, interact with web content |
+| `Task (Spawn agent)` | Spawn a subagent with its own loop, tools, and isolated worktree |
 
-**Built-in tools:**
+Tools are the agent's hands. The model never directly modifies files or runs code — it requests tool calls, and the harness does the execution.
 
-- `BashTool`
-- `FileReadTool`, `FileEditTool`, `FileWriteTool`
-- `GlobTool`, `GrepTool`
-- `WebFetchTool`, `WebSearchTool`
-- `NotebookEditTool`
-- `AgentTool`, `SkillTool`
-- `TaskCreateTool`, `TaskGetTool`, `TaskUpdateTool`, `TaskListTool`
-- `ListMcpResourcesTool`, `ReadMcpResourceTool`, `ToolSearchTool`
-- Planning/worktree tools and additional gated tools enabled by build flags
+### Permission governance
 
----
-
-## Important Entry Points
-
-If you are trying to understand or reconstruct the project, start here:
-
-1. **`main.tsx`** — Main bootstrap path. Wires startup profiling, config loading, auth/session setup, CLI parsing, telemetry initialization, feature gating, and REPL/session launch behavior.
-2. **`commands.ts`** — Central registry for builtin commands. The best high-level view of the command surface and which features are conditionally enabled.
-3. **`Tool.ts`** — Defines the core tool execution contracts, permission context, progress types, and runtime interfaces shared across tool implementations.
-4. **`tools.ts`** — Registers the builtin tools and shows which tools are always present versus feature-gated or environment-specific.
-5. **`components/App.tsx`** — Top-level wrapper for interactive sessions, wiring the app state, stats, and FPS-related providers used by the terminal UI.
+Before any tool executes, the harness checks against a permission layer:
+- **Read-only tools** (grep, glob, read) are freely allowed.
+- **Write/destructive tools** (bash, write, edit) may require confirmation depending on the trust level and scope of the current task.
+- **Network tools** (browser, fetch) are gated on explicit allowlists in sensitive environments.
 
 ---
 
-## Working With This Repository
+## Subagent Spawning <a name="subagent-spawning"></a>
 
-The safest way to treat this repo is as a source archive that you can explore and incrementally restore.
+For complex tasks, the orchestrator spawns specialised subagents via the `Task` tool. Each subagent:
 
-**Recommended workflows:**
+1. Gets its own isolated agent loop
+2. Runs in a separate git worktree (preventing conflicts with parallel agents)
+3. Has access to the same tool layer
+4. Communicates results back via an **async mailbox**
 
-- Use it for code search, reference, and architectural recovery
-- Extract specific subsystems into other projects if needed
-- Reconstruct missing root metadata before attempting a full local build
+### Three subagent archetypes
 
-**Useful exploration commands:**
+**Plan agent** — Decomposes a high-level goal into a dependency graph of subtasks. Produces a structured task list that the orchestrator and other agents can consume.
 
-```bash
-rg "feature\(" .
-rg "import .* from 'src/" .
-rg "Tool" tools/ tools.ts
-rg "commands/" commands.ts
+**Explore agent** — Reads source code, searches the codebase, gathers context. Specialised for reconnaissance — finding where things live before changes are made.
+
+**Task agent** — Implements a specific change: writes code, runs tests, commits results. Works in an isolated worktree so multiple task agents can run in parallel without stepping on each other.
+
+### Async coordination
+
+Agents communicate via mailboxes rather than blocking calls. The orchestrator sends work to subagents and continues (or waits). When a subagent finishes, it posts its result to the orchestrator's mailbox. This enables genuine parallelism across large tasks.
+
+```
+Orchestrator
+    │
+    ├──[Task tool]──► Plan agent   → posts result to mailbox
+    ├──[Task tool]──► Explore agent → posts result to mailbox
+    └──[Task tool]──► Task agent   → posts result to mailbox
+                           ↓
+              Orchestrator reads mailbox, synthesises, responds
 ```
 
 ---
 
-## What Is Missing To Make It Runnable
+## Memory Architecture <a name="memory-architecture"></a>
 
-To turn this repository into a normal buildable project, restore or recreate:
+Claude Code has no persistent memory in the model weights for your project — instead it uses a layered external memory system:
 
-1. The package manifest and lockfile (`package.json`, `pnpm-lock.yaml`)
-2. The original TypeScript path alias configuration (`tsconfig.json`)
-3. Bun/Node build scripts
-4. Linting, formatting, and test configuration
-5. CI workflows and release metadata
-6. Any generated assets or build-time codegen inputs not included in this snapshot
+### Layer 1 — In-context memory (volatile)
 
-The code strongly suggests a Bun-based build with a TypeScript/React/Ink stack, but without the original root manifests the exact install or run commands cannot be stated confidently.
+The live `messages[]` array. Everything the model can "see" right now. Auto-compacted (summarised) when it approaches the token limit. Completely reset between sessions unless explicitly restored.
+
+### Layer 2 — External file memory (session-scoped)
+
+- **`CLAUDE.md`** — A markdown file at the project root. Claude reads this at the start of every session. Put your coding standards, architecture decisions, common commands, and project conventions here. This is the primary way to give Claude durable project knowledge.
+- **`~/.claude/`** — User-level preferences and global instructions, loaded on startup.
+- **Skill files** — Markdown files that describe how to use a tool or perform a task. Loaded on demand when the agent determines they're relevant.
+
+### Layer 3 — Task state memory (run-scoped)
+
+- **Dependency graph** — The task system tracks which subtasks are pending, in-progress, blocked, or done. Survives agent hops within a session.
+- **Async mailboxes** — Per-agent inboxes that buffer results across parallel workstreams.
+- **Git checkpoints** — Worktree commits serve as implicit state snapshots for parallel task agents.
+
+### Layer 4 — Long-term external memory (persistent across sessions)
+
+Via MCP (Model Context Protocol) servers:
+- Vector stores / RAG (e.g., ChromaDB, pgvector) for semantic search over codebase history
+- Session restore tools that ingest prior Claude Code session logs
+- Arbitrary databases via MCP tool integrations
+
+### Read order per turn
+
+```
+Long-term MCP stores
+       ↓
+External files (CLAUDE.md, skills)
+       ↓
+Task state (dep. graph, mailboxes)
+       ↓
+Inject into in-context window for this turn
+```
 
 ---
 
-## Caveats
+## The Full End-to-End Flow <a name="full-flow"></a>
 
-- Some imports still assume the original project layout and alias setup.
-- Some features are only enabled when specific build flags or environment variables are present.
-- Because the repo is source-only, setup instructions from the original project are not yet recoverable from this checkout alone.
-- Before sharing or operationalizing the code more broadly, review secrets, endpoints, credentials, and licensing posture carefully.
+Here is the complete journey from a user request to a committed code change:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. USER types a task in the terminal                           │
+│     e.g. "Add pagination to the /users endpoint"                │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────────┐
+│  2. HARNESS builds context                                      │
+│     • Loads CLAUDE.md, skill files, memory                      │
+│     • Constructs messages[] with system prompt + task           │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────────┐
+│  3. ORCHESTRATOR (primary agent loop)                           │
+│     • Calls LLM → receives plan + tool_use blocks               │
+│     • May spawn Plan agent to build dependency graph            │
+│     • May spawn Explore agents to read relevant files           │
+│     • Spawns Task agents for each implementation subtask        │
+└────────────────────────┬────────────────────────────────────────┘
+                         │ (parallel)
+          ┌──────────────┼──────────────┐
+          ▼              ▼              ▼
+     Plan agent    Explore agent   Task agent(s)
+     builds dep.   reads code,     implement in
+     graph         finds patterns  isolated worktrees
+          │              │              │
+          └──────────────┴──────────────┘
+                         │ results → mailboxes
+┌────────────────────────▼────────────────────────────────────────┐
+│  4. ORCHESTRATOR synthesises results                            │
+│     • Reads mailboxes, checks task graph                        │
+│     • Runs integration tests via Bash tool                      │
+│     • Compresses context if needed                              │
+└────────────────────────┬────────────────────────────────────────┘
+                         │
+┌────────────────────────▼────────────────────────────────────────┐
+│  5. OUTPUT returned to user                                     │
+│     • Summary of changes made                                   │
+│     • Files edited, tests passed, git diff                      │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## Suggested Next Steps
+## Key Design Principles <a name="design-principles"></a>
 
-1. Add missing root project metadata (`package.json`, lockfile, `tsconfig.json`, formatter/linter config)
-2. Decide whether to keep the source at repo root or move it back under a conventional `src/` layout
-3. Document the command surface and tool model in dedicated docs
-4. Add a license and contribution policy
-5. Add tests and CI once the build is reproducible
+**Model drives, harness serves.** Claude Code does not impose rigid workflows or second-guess the model with elaborate decision trees. It provides tools, knowledge, and context — then gets out of the way.
 
-Until then, this README should be read as documentation for a recovered source tree rather than a finished distributable repository.
+**Isolation by default.** Parallel task agents work in separate git worktrees. A broken change in one agent cannot corrupt another agent's work.
+
+**Context is precious.** The harness actively manages the context window — compressing history, loading skills on demand, and using external memory to avoid blowing the token budget on stale information.
+
+**Permission boundaries, not walls.** Destructive tools require confirmation rather than being blocked outright. The agent can always ask the user when it's uncertain.
+
+**Stateless model, stateful harness.** The LLM has no memory between turns. The harness is responsible for reconstructing the world for each call — injecting the right context so the model can act as if it remembers.
+
+---
+
+## Quickstart <a name="quickstart"></a>
+
+### Prerequisites
+
+- Node.js 18+
+- An Anthropic API key
+
+### Install
+
+```bash
+npm install -g @anthropic-ai/claude-code
+```
+
+### Run
+
+```bash
+cd your-project
+claude
+```
+
+Claude Code will read your `CLAUDE.md` (if present), load project context, and enter the interactive loop.
+
+### Add project memory
+
+Create a `CLAUDE.md` at your project root:
+
+```markdown
+# Project: My App
+
+## Architecture
+- Backend: FastAPI (Python 3.11)
+- Database: PostgreSQL via SQLAlchemy
+- Tests: pytest, run with `make test`
+
+## Conventions
+- All endpoints go in `src/api/`
+- DB models go in `src/models/`
+- Never commit directly to `main` — always use feature branches
+
+## Common commands
+- Start dev server: `make dev`
+- Run linter: `make lint`
+- Apply migrations: `alembic upgrade head`
+```
+
+The richer your `CLAUDE.md`, the more autonomously Claude Code can work without asking clarifying questions.
+
+---
+
+## Configuration <a name="configuration"></a>
+
+| File | Scope | Purpose |
+|------|-------|---------|
+| `CLAUDE.md` | Project | Coding standards, architecture, conventions |
+| `~/.claude/CLAUDE.md` | User | Personal preferences across all projects |
+| `.claude/settings.json` | Project | Tool permissions, model selection, MCP servers |
+| `~/.claude/settings.json` | User | Global defaults |
+
+### MCP server configuration
+
+Connect long-term memory, internal tools, and external APIs via MCP:
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-memory"]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/project"]
+    }
+  }
+}
+```
+
+---
+
+## Contributing <a name="contributing"></a>
+
+Issues and pull requests welcome. When contributing:
+
+1. Fork the repo and create a feature branch
+2. Add or update tests for any changed behaviour
+3. Update `CLAUDE.md` if you change project conventions
+4. Open a PR — a description of *why* the change matters helps reviewers move faster
+
+---
+
+*Built on the Claude API by Anthropic. This repository is an independent harness implementation and educational reference — not the official Anthropic Claude Code product.*
